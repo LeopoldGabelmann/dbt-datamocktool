@@ -1,82 +1,106 @@
-{% macro get_unit_test_sql(model, input_mapping, depends_on) %}
-    {% set ns=namespace(
-        test_sql="(select 1) raw_sql",
-        rendered_keys={},
-        graph_model=none
-    ) %}
+{%- macro unit_test(model, input_mapping, expected_output, name, description, compare_columns, depends_on) -%}
+    {%- set test_sql = get_unit_test_sql(model, input_mapping, depends_on)|trim -%}
 
-    {% for k in input_mapping.keys() %}
-        {# doing this outside the execute block allows dbt to infer the proper dependencies #}
-        {% do ns.rendered_keys.update({k: render("{{ " + k + " }}")}) %}
-    {% endfor %}
+    {%- set test_report = test_equality(expected_output, name, compare_model=test_sql, compare_columns=compare_columns) -%}
+    {%- do return(test_report) -%}
+{%- endmacro -%}
 
-    {% if execute %}
-        {# inside an execute block because graph nodes aren't well-defined during parsing #}
-        {% set ns.graph_model = graph.nodes.get("model." + project_name + "." + model.name) %}
-        {# if the model uses an alias, the above call was unsuccessful, so loop through the graph to grab it by the alias instead #}
-        {% if ns.graph_model is none %}
-            {% for node in graph.nodes.values() %}
-                {% if node.alias == model.name and node.schema == model.schema %}
-                    {% set ns.graph_model = node %}
-                {% endif %}
-            {% endfor %}
-        {% endif %}
-        {% set ns.test_sql = ns.graph_model.raw_sql %}
 
-        {% for k,v in input_mapping.items() %}
-            {# render the original sql and replacement key before replacing because v is already rendered when it is passed to this test #}
-            {% set ns.test_sql = render(ns.test_sql)|replace(ns.rendered_keys[k], v) %}
-        {% endfor %}
+{%- macro test_equality(model, name, compare_model, compare_columns=None) -%}
 
-        {% set mock_model_relation = dbt_datamocktool._get_model_to_mock(
-            model, suffix=('_dmt_' ~ modules.datetime.datetime.now().strftime("%S%f"))
-        ) %}
+{%- set set_diff -%}
+    count(*) + coalesce(abs(
+        sum(case when which_diff = 'a_minus_b' then 1 else 0 end) -
+        sum(case when which_diff = 'b_minus_a' then 1 else 0 end)
+    ), 0)
+{%- endset -%}
 
-        {% do dbt_datamocktool._create_mock_table_or_view(mock_model_relation, ns.test_sql) %}
-    {% endif %}
+{#-- Needs to be set at parse time, before we return '' below --#}
+{{ config(fail_calc = set_diff) }}
 
-    {% for k in depends_on %}
-        -- depends_on: {{ k }}
-    {% endfor %}
-    
-    {{ mock_model_relation }}
+{#-- Prevent querying of db in parsing mode. This works because this macro does not create any new refs. #}
+{%- if not execute -%}
+    {{ return('') }}
+{%- endif -%}
+
+-- setup
+{%- do dbt_utils._is_relation(model, 'test_equality') -%}
+
+{#-
+If the compare_cols arg is provided, we can run this test without querying the
+information schema — this allows the model to be an ephemeral model
+-#}
+
+{%- if not compare_columns -%}
+    {%- do dbt_utils._is_ephemeral(model, 'test_equality') -%}
+    {%- set compare_columns = adapter.get_columns_in_relation(model) | map(attribute='quoted') -%}
+{%- endif -%}
+
+{%- set compare_cols_csv = compare_columns | join(', ') -%}
+
+{%- set tables_compared -%}
+with a as (
+
+    select * from {{ model }}
+
+),
+
+b as (
+
+    select * from {{ compare_model }}
+
+),
+
+a_minus_b as (
+
+    select {{compare_cols_csv}} from a
+    {{ dbt.except() }}
+    select {{compare_cols_csv}} from b
+
+),
+
+b_minus_a as (
+
+    select {{compare_cols_csv}} from b
+    {{ dbt.except() }}
+    select {{compare_cols_csv}} from a
+
+),
+
+unioned as (
+
+    select 'actual' as which_diff, b_minus_a.* from b_minus_a
+    union all
+    select 'expected' as which_diff, a_minus_b.* from a_minus_b
+
+)
+
+select * from unioned
+{%- endset -%}
+
+    {#- Run the comparison query -#}
+    {%- set test_report = run_query(tables_compared) -%}
+    {#- Print output if there are any rows within the table. -#}
+    {%- if test_report.columns[0].values()|length -%}
+        {{ print_color('{YELLOW}The test <' ~ name ~ '> failed with the differences:') }}
+        {{ print_color('{RED}================================================================') }}
+        {% do test_report.print_table() %}
+    {{ print_color('{RED}================================================================') }}
+    {%- endif -%}
+
+{{ return(tables_compared) }}
+{%- endmacro -%}
+
+
+
+{% macro print_color(string) %}
+  {% do log(parse_colors(string ~ "{RESET}"), info=true) %}
 {% endmacro %}
 
-
-{% macro _get_model_to_mock(model, suffix) %}
-    {{ return(adapter.dispatch('_get_model_to_mock', 'dbt_datamocktool')(model, suffix)) }}
-{% endmacro %}
-
-{% macro default___get_model_to_mock(model, suffix) %}
-    {{ return(make_temp_relation(model.incorporate(type='table'), suffix=suffix)) }}
-{% endmacro %}
-
-{# Spark-specific logic excludes a schema name in order to fix https://github.com/mjirv/dbt-datamocktool/issues/22 #}
-{% macro spark___get_model_to_mock(model, suffix) %}
-    {{ return(make_temp_relation(model.incorporate(type='table').include(schema=False), suffix=suffix)) }}
-{% endmacro %}
-
-{# SQL Server logic creates a view instead of a temp table to fix https://github.com/mjirv/dbt-datamocktool/issues/42 #}
-{% macro sqlserver___get_model_to_mock(model, suffix) %}
-    {% set schema = "datamocktool_tmp" %}
-    {% if not adapter.check_schema_exists(database=model.database, schema=schema) %}
-        {% do adapter.create_schema(api.Relation.create(database=model.database, schema=schema)) %}
-    {% endif %}
-    {% set tmp_identifier = model.identifier ~ suffix %}
-    {# SQL Server requires us to specify a table type because it calls `drop_relation_script()` from `create_table_as()`.
-    I'd prefer to use something like RelationType.table, but can't find a way to access the relation types #}
-    {{ return(model.incorporate(type='view', path={"identifier": tmp_identifier, "schema": schema})) }}
-{% endmacro %}
-
-
-{% macro _create_mock_table_or_view(model, test_sql) %}
-    {{ return(adapter.dispatch('_create_mock_table_or_view', 'dbt_datamocktool')(model, test_sql)) }}
-{% endmacro %}
-
-{% macro default___create_mock_table_or_view(model, test_sql) %}
-    {% do run_query(create_table_as(True, model, test_sql)) %}
-{% endmacro %}
-
-{% macro sqlserver___create_mock_table_or_view(model, test_sql) %}
-    {% do run_query(create_view_as(model, test_sql)) %}
+{% macro parse_colors(string) %}
+  {{ return (string
+      .replace("{RED}", "\x1b[0m\x1b[31m")
+      .replace("{GREEN}", "\x1b[0m\x1b[32m")
+      .replace("{YELLOW}", "\x1b[0m\x1b[33m")
+      .replace("{RESET}", "\x1b[0m")) }}
 {% endmacro %}
